@@ -157,7 +157,7 @@ process_submodule() {
 
   # target 分支在本地和远程都不存在 -> 跳过该子模块
   if ! branch_exists "$target"; then
-    echo "⚠️  $path 无 target 分支 $target（本地与远程均不存在），跳过该子模块"
+    echo "⚠️  $path 无 target 分支 ${target}（本地与远程均不存在），跳过该子模块"
     cd "$ROOT_DIR"
     return 0
   fi
@@ -173,7 +173,7 @@ process_submodule() {
   git fetch origin "$target" 2>/dev/null || true
   # 再次校验（fetch 后远程可能已存在）
   if ! branch_exists "$target"; then
-    echo "⚠️  $path 无 target 分支 $target（本地与远程均不存在），跳过该子模块"
+    echo "⚠️  $path 无 target 分支 ${target}（本地与远程均不存在），跳过该子模块"
     cd "$ROOT_DIR"
     return 0
   fi
