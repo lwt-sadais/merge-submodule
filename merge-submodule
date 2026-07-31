@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# merge-submodule: 将每个子模块的源分支合并到该子模块的 target 分支
+#
+# 用法：cd 到项目目录后执行
+#   merge-submodule <target-branch>
+#
+# 说明：
+#   - 仅处理子模块内部，主项目完全不动
+#   - 源分支优先取 .gitmodules 中配置的 branch，未配置则取子模块当前 HEAD 所在分支
+#   - 源分支与 target 分支都会先与远程同步（fetch/pull 处理 ahead/behind），再 merge
+#   - 子模块无 target 分支时报错并跳过该子模块
+#   - 子模块处于 detached HEAD 且未配置 branch 时报错退出
+
+set -euo pipefail
+
+ROOT_DIR=$(pwd)
+
+# ============================ 参数校验 ============================
+if [[ $# -ne 1 ]]; then
+  echo "用法: merge-submodule <target-branch>"
+  echo "示例: merge-submodule master"
+  echo "      merge-submodule zsgr-master"
+  exit 1
+fi
+
+TARGET_BRANCH="$1"
+
+if [[ ! -d "$ROOT_DIR/.git" && ! -f "$ROOT_DIR/.git" ]]; then
+  echo "❌ 当前目录 $ROOT_DIR 不是 git 仓库"
+  exit 1
+fi
+
+if [[ ! -f "$ROOT_DIR/.gitmodules" ]]; then
+  echo "⚠️  未找到 .gitmodules，无需处理"
+  exit 0
+fi
+
+# ============================ 核心函数 ============================
+
+# 分支同步核心逻辑：fetch -> 处理脏工作区 -> ahead/behind 同步
+# 参数：$1 = 分支名
+sync_branch() {
+  local branch="$1"
+  local dirty behind ahead
+
+  git fetch origin "$branch" || { echo "❌ fetch origin $branch 失败"; exit 1; }
+
+  dirty=$(git status --porcelain)
+  behind=$(git rev-list --count "$branch..origin/$branch" 2>/dev/null || echo 0)
+  ahead=$(git rev-list --count "origin/$branch..$branch" 2>/dev/null || echo 0)
+  # 工作区有改动：先 stash 再 pull，最后 pop 并提交
+  if [[ -n "$dirty" ]]; then
+    if [[ "$ahead" -gt 0 && "$behind" -gt 0 ]]; then
+      git stash push || { echo "❌ stash 失败"; exit 1; }
+      git reset --hard "origin/$branch" || { echo "❌ reset $branch 失败"; exit 1; }
+      git stash pop || { echo "❌ stash pop 失败"; exit 1; }
+      behind=0
+    elif [[ "$behind" -gt 0 ]]; then
+      git stash push || { echo "❌ stash 失败"; exit 1; }
+      git pull || { echo "❌ pull $branch 失败"; exit 1; }
+      behind=0
+      git stash pop || { echo "❌ stash pop 失败"; exit 1; }
+    fi
+    git add .
+    git commit -m "自动化提交本地修改" || { echo "❌ commit 失败"; exit 1; }
+  fi
+
+  ahead=$(git rev-list --count "origin/$branch..$branch" 2>/dev/null || echo 0)
+
+  # 既领先又落后：放弃本地提交，强制对齐远程
+  if [[ "$ahead" -gt 0 && "$behind" -gt 0 ]]; then
+    git reset --hard "origin/$branch" || { echo "❌ reset $branch 失败"; exit 1; }
+  elif [[ "$ahead" -gt 0 ]]; then
+    git push || { echo "❌ push $branch 失败"; exit 1; }
+  elif [[ "$behind" -gt 0 ]]; then
+    git pull || { echo "❌ pull $branch 失败"; exit 1; }
+  fi
+}
+
+# 后序递归收集子模块（从内到外），结果存入全局数组 SUB_PATHS / SUB_BRANCHES
+# 参数：$1 = 相对 ROOT_DIR 的目录路径（空串表示根目录）
+collect_submodules() {
+  local base="$1"
+  local gm="$ROOT_DIR/${base:+$base/}.gitmodules"
+  [[ ! -f "$gm" ]] && return 0
+
+  local line cur_path="" cur_branch="" full_path
+  local in_block=0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # 遇到新的 [submodule ...] 块：先把上一个子模块入队（先递归后入队 = 后序）
+    if [[ "$line" =~ ^\[submodule[[:space:]]+\"(.+)\" ]]; then
+      if [[ -n "$cur_path" ]]; then
+        full_path="${base:+$base/}$cur_path"
+        collect_submodules "$full_path"
+        SUB_PATHS+=("$full_path")
+        SUB_BRANCHES+=("$cur_branch")
+      fi
+      cur_path=""
+      cur_branch=""
+      in_block=1
+      continue
+    fi
+    # 在子模块块内解析 path / branch
+    if [[ $in_block -eq 1 ]]; then
+      if [[ "$line" =~ ^[[:space:]]*path[[:space:]]*=[[:space:]]*(.+)$ ]]; then
+        cur_path="${BASH_REMATCH[1]}"
+      elif [[ "$line" =~ ^[[:space:]]*branch[[:space:]]*=[[:space:]]*(.+)$ ]]; then
+        cur_branch="${BASH_REMATCH[1]}"
+      fi
+    fi
+  done < "$gm"
+
+  # 处理最后一个子模块
+  if [[ -n "$cur_path" ]]; then
+    full_path="${base:+$base/}$cur_path"
+    collect_submodules "$full_path"
+    SUB_PATHS+=("$full_path")
+    SUB_BRANCHES+=("$cur_branch")
+  fi
+}
+
+# 判断分支在本地或远程是否存在（用于校验 target 分支）
+# 参数：$1 = 分支名
+# 返回：0 存在 / 1 不存在
+branch_exists() {
+  local branch="$1"
+  # 本地分支存在
+  if git show-ref --verify --quiet "refs/heads/$branch"; then
+    return 0
+  fi
+  # 远程分支存在（origin 已 fetch 过）
+  if git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+    return 0
+  fi
+  return 1
+}
+
+# 处理单个子模块：源分支同步 -> 切 target 同步 -> 合并源分支 -> 回切
+# 参数：$1 = 子模块路径  $2 = 源分支（可空，空则取 HEAD 所在分支）  $3 = targetBranch
+process_submodule() {
+  local path="$1" local_branch="$2" target="$3"
+  local current
+
+  echo "---------- 处理子模块：$path (target=$target) ----------"
+  cd "$ROOT_DIR/$path" || { echo "❌ 进入 $path 失败"; exit 1; }
+
+  # .gitmodules 未配置 branch 时，取子模块当前所在分支作为源分支
+  if [[ -z "$local_branch" ]]; then
+    local_branch=$(git rev-parse --abbrev-ref HEAD)
+    if [[ -z "$local_branch" || "$local_branch" == "HEAD" ]]; then
+      echo "❌ $path 处于 detached HEAD 且未配置 branch，无法确定源分支"
+      exit 1
+    fi
+    echo "ℹ️  $path 未配置 branch，使用当前分支 $local_branch"
+  fi
+
+  # target 分支在本地和远程都不存在 -> 跳过该子模块
+  if ! branch_exists "$target"; then
+    echo "⚠️  $path 无 target 分支 $target（本地与远程均不存在），跳过该子模块"
+    cd "$ROOT_DIR"
+    return 0
+  fi
+
+  current=$(git rev-parse --abbrev-ref HEAD)
+  if [[ "$current" == "HEAD" ]]; then
+    echo "❌ $path 当前处于 detached HEAD，无法继续"
+    exit 1
+  fi
+  [[ "$current" != "$local_branch" ]] && { git checkout "$local_branch" || { echo "❌ checkout $local_branch 失败"; exit 1; }; }
+
+  # 先 fetch 一次，确保 target 分支存在性判断基于最新远程状态
+  git fetch origin "$target" 2>/dev/null || true
+  # 再次校验（fetch 后远程可能已存在）
+  if ! branch_exists "$target"; then
+    echo "⚠️  $path 无 target 分支 $target（本地与远程均不存在），跳过该子模块"
+    cd "$ROOT_DIR"
+    return 0
+  fi
+
+  sync_branch "$local_branch"
+
+  git checkout "$target" || { echo "❌ checkout $target 失败"; exit 1; }
+  sync_branch "$target"
+  git merge "$local_branch" --no-edit || { echo "❌ merge $local_branch -> $target 失败"; exit 1; }
+  git push || { echo "❌ push $target 失败"; exit 1; }
+  git checkout "$local_branch" || { echo "❌ 回切 $local_branch 失败"; exit 1; }
+
+  cd "$ROOT_DIR"
+}
+
+# ============================ 主流程 ============================
+
+echo "========== merge-submodule: target=$TARGET_BRANCH =========="
+
+# 后序收集子模块（从内到外）
+SUB_PATHS=()
+SUB_BRANCHES=()
+collect_submodules ""
+
+if [[ ${#SUB_PATHS[@]} -eq 0 ]]; then
+  echo "⚠️  未解析到任何子模块"
+  exit 0
+fi
+
+echo "共发现 ${#SUB_PATHS[@]} 个子模块（从内到外）："
+for i in "${!SUB_PATHS[@]}"; do
+  echo "  - ${SUB_PATHS[$i]} (branch=${SUB_BRANCHES[$i]:-<当前HEAD>})"
+done
+echo ""
+
+# 逐个处理子模块
+for i in "${!SUB_PATHS[@]}"; do
+  process_submodule "${SUB_PATHS[$i]}" "${SUB_BRANCHES[$i]}" "$TARGET_BRANCH"
+done
+
+echo "========== merge-submodule 完成 =========="
