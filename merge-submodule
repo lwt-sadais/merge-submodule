@@ -295,7 +295,7 @@ process_submodule() {
 
   git checkout "$target" || { echo "❌ checkout $target 失败"; exit 1; }
   sync_branch "$target"
-  git merge "$local_branch" --no-edit || { echo "❌ merge $local_branch -> $target 失败"; exit 1; }
+  git merge "$local_branch" -X theirs --no-edit || { echo "❌ merge $local_branch -> $target 失败"; exit 1; }
   check_and_fix_gitmodules "$target" "$path"
   git push || { echo "❌ push $target 失败"; exit 1; }
   git checkout "$local_branch" || { echo "❌ 回切 $local_branch 失败"; exit 1; }
