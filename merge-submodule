@@ -158,10 +158,10 @@ check_and_fix_gitmodules() {
           echo "⚠️  $sub_path/$cur_path 未配置 branch，将自动补齐为 $target"
           has_mismatch=1
         elif [[ "$cur_branch" != "$target" ]]; then
-          echo "⚠️  $sub_path/$cur_path branch=$cur_branch 不等于目标分支 $target，将自动修正"
+          echo "⚠️  $sub_path/$cur_path branch=$cur_branch 不等于目标分支 ${target}，将自动修正"
           has_mismatch=1
         else
-          echo "✅ $sub_path/$cur_path branch=$cur_branch 已指向 $target"
+          echo "✅ $sub_path/$cur_path branch=$cur_branch 已指向 ${target}"
         fi
       fi
       cur_path=""
@@ -178,10 +178,10 @@ check_and_fix_gitmodules() {
   # 处理最后一个子模块块
   if [[ -n "$cur_path" ]]; then
     if [[ -z "$cur_branch" ]]; then
-      echo "⚠️  $sub_path/$cur_path 未配置 branch，将自动补齐为 $target"
+      echo "⚠️  $sub_path/$cur_path 未配置 branch，将自动补齐为 ${target}"
       has_mismatch=1
     elif [[ "$cur_branch" != "$target" ]]; then
-      echo "⚠️  $sub_path/$cur_path branch=$cur_branch 不等于目标分支 $target，将自动修正"
+      echo "⚠️  $sub_path/$cur_path branch=$cur_branch 不等于目标分支 ${target}，将自动修正"
       has_mismatch=1
     else
       echo "✅ $sub_path/$cur_path branch=$cur_branch 已指向 $target"
