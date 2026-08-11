@@ -9,7 +9,7 @@
 - 🔄 **递归处理嵌套子模块**：后序遍历，从最内层子模块开始合并
 - 🎯 **源分支智能识别**：优先取 `.gitmodules` 配置的 `branch`，未配置则取子模块当前 `HEAD` 所在分支
 - 🔁 **自动同步远程**：源分支与目标分支都会先 `fetch` + 处理脏工作区 + ahead/behind 同步，再合并
-- 🧹 **脏工作区处理**：本地有改动时自动 stash → pull/reset → pop → commit，无需手动清理
+- 🧹 **脏工作区处理**：分支落后时自动暂存已跟踪及未跟踪文件，只恢复本次创建的 stash；恢复冲突时保留 stash 并停止
 - 🛡️ **安全跳过**：子模块无目标分支时打印警告并跳过，不影响其它子模块
 - 🚫 **detached HEAD 保护**：子模块处于 detached HEAD 且未配置 branch 时报错退出
 - 🔴 **日志醒目显示**：脚本自身日志统一使用红色加粗样式，Git 命令的原生输出不受影响
@@ -53,7 +53,7 @@ merge-submodule zsgr-master   # 合并到 zsgr-master
 
 ```
 1. 确定源分支：.gitmodules 的 branch，未配置则 git rev-parse --abbrev-ref HEAD
-2. 源分支同步：fetch -> 脏工作区处理(stash/pull/pop/commit) -> ahead/behind 对齐
+2. 源分支同步：fetch -> 脏工作区处理(stash/pull 或 reset/apply/commit) -> ahead/behind 对齐
 3. 切目标分支 -> 同步目标分支 -> merge 源分支(--no-edit) -> push -> 回切源分支
 ```
 
@@ -67,7 +67,10 @@ merge-submodule zsgr-master   # 合并到 zsgr-master
 | 未配置 branch | 取子模块当前 `HEAD` 所在分支 |
 | 子模块无目标分支 | 打印警告并跳过该子模块，继续处理其它 |
 | detached HEAD 且未配置 branch | 报错退出整个流程 |
-| 本地工作区有改动 | 自动 stash → 同步 → pop → commit |
+| 本地工作区有改动且分支落后 | 自动 stash 已跟踪及未跟踪文件 → 同步 → 精确 apply 本次 stash → commit |
+| 本地工作区有改动且分支不落后 | 直接自动提交 |
+| 已存在用户 stash | 不恢复、不删除，只处理脚本本次创建的 stash |
+| stash 恢复冲突 | 立即停止并保留 stash，输出仓库、分支、冲突文件及人工恢复指引，不自动覆盖任一侧 |
 | 既领先又落后 | `reset --hard origin/<branch>` 强制对齐远程 |
 | 任一 git 步骤失败 | 立即退出并提示 |
 

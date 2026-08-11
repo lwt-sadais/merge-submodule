@@ -42,32 +42,153 @@ fi
 
 # ============================ 核心函数 ============================
 
+# 根据对象 ID 查找对应的 stash 引用，避免依赖可能变化的 stash 顺序
+# 参数：$1 = stash 对象 ID
+find_stash_ref() {
+  local expected_oid="$1"
+  local stash_ref stash_oid
+
+  while read -r stash_ref stash_oid; do
+    if [[ "$stash_oid" == "$expected_oid" ]]; then
+      printf '%s\n' "$stash_ref"
+      return 0
+    fi
+  done < <(git stash list --format='%gd %H')
+  return 1
+}
+
+# 保存当前仓库可暂存的修改，并记录本次新建的 stash 对象 ID
+# 参数：$1 = 分支名；结果写入全局变量 AUTO_STASH_OID
+create_auto_stash() {
+  local branch="$1"
+  local previous_oid current_oid
+
+  AUTO_STASH_OID=""
+  previous_oid=$(git rev-parse --quiet --verify refs/stash 2>/dev/null || true)
+  git stash push --include-untracked -m "merge-submodule 自动暂存：$branch" || { log "❌ stash $branch 失败"; exit 1; }
+  current_oid=$(git rev-parse --quiet --verify refs/stash 2>/dev/null || true)
+
+  if [[ -n "$current_oid" && "$current_oid" != "$previous_oid" ]]; then
+    AUTO_STASH_OID="$current_oid"
+    log "ℹ️  已创建本次自动 stash：$AUTO_STASH_OID"
+  else
+    log "ℹ️  当前变化不属于可暂存内容，未创建自动 stash"
+  fi
+}
+
+# 输出 stash 恢复失败后的现场和人工处理指引，保留 stash 作为修改备份
+# 参数：$1 = 分支名  $2 = stash 对象 ID
+report_stash_restore_failure() {
+  local branch="$1"
+  local stash_oid="$2"
+  local stash_ref current_branch conflict_file status_line
+
+  stash_ref=$(find_stash_ref "$stash_oid" || true)
+  current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || printf '<未知>')
+
+  log "❌ 自动 stash 恢复失败，已停止后续提交和推送"
+  log "📁 当前仓库：$(pwd -P)"
+  log "🌿 当前分支：${current_branch}（同步分支：${branch}）"
+  log "📦 保留 stash：${stash_ref:-<未找到引用>}（${stash_oid}）"
+
+  if git diff --name-only --diff-filter=U | grep -q .; then
+    log "⚠️  未合并文件："
+    while IFS= read -r conflict_file; do
+      log "  - $conflict_file"
+    done < <(git diff --name-only --diff-filter=U)
+  fi
+
+  log "ℹ️  当前状态："
+  while IFS= read -r status_line; do
+    log "  $status_line"
+  done < <(git status --short)
+  log "ℹ️  请先解决冲突并执行 git add；确认修改无误后重新运行本命令"
+  log "ℹ️  确认不再需要备份后，可执行：git stash drop ${stash_ref:-<stash引用>}"
+}
+
+# 精确恢复并保留本次创建的 stash；成功提交后才删除该 stash
+# 参数：$1 = 分支名  $2 = stash 对象 ID
+restore_auto_stash() {
+  local branch="$1"
+  local stash_oid="$2"
+  local stash_ref
+
+  if [[ -z "$stash_oid" ]]; then
+    if [[ -n "$(git status --porcelain)" ]]; then
+      commit_worktree_changes
+    else
+      log "ℹ️  同步后工作区已干净，无需恢复 stash"
+    fi
+    return 0
+  fi
+
+  if ! git stash apply "$stash_oid"; then
+    report_stash_restore_failure "$branch" "$stash_oid"
+    exit 1
+  fi
+
+  git add . || { log "❌ git add 本地修改失败；自动 stash 已保留：$stash_oid"; exit 1; }
+  if git diff --cached --quiet; then
+    if [[ -n "$(git status --porcelain)" ]]; then
+      log "❌ 恢复后仍有无法暂存的变化，请检查仓库：$(pwd -P)"
+      log "📦 自动 stash 已保留：$stash_oid"
+      exit 1
+    fi
+    log "ℹ️  stash 内容已被远程更新覆盖，无需创建提交"
+  else
+    git commit -m "自动化提交本地修改" || { log "❌ commit 失败；自动 stash 已保留：$stash_oid"; exit 1; }
+  fi
+
+  stash_ref=$(find_stash_ref "$stash_oid" || true)
+  if [[ -n "$stash_ref" ]]; then
+    git stash drop "$stash_ref" || { log "❌ 删除本次自动 stash 失败：$stash_ref"; exit 1; }
+  fi
+}
+
+# 提交无需 stash 即可保留的当前工作区变化
+commit_worktree_changes() {
+  local status_line
+
+  git add . || { log "❌ git add 本地修改失败"; exit 1; }
+  if git diff --cached --quiet; then
+    log "❌ 当前仓库存在无法由父仓库提交的变化：$(pwd -P)"
+    while IFS= read -r status_line; do
+      log "  $status_line"
+    done < <(git status --short)
+    exit 1
+  fi
+  git commit -m "自动化提交本地修改" || { log "❌ commit 失败"; exit 1; }
+}
+
 # 分支同步核心逻辑：fetch -> 处理脏工作区 -> ahead/behind 同步
 # 参数：$1 = 分支名
 sync_branch() {
   local branch="$1"
   local dirty behind ahead
+  local auto_stash_oid=""
 
   git fetch origin "$branch" || { log "❌ fetch origin $branch 失败"; exit 1; }
 
   dirty=$(git status --porcelain)
   behind=$(git rev-list --count "$branch..origin/$branch" 2>/dev/null || echo 0)
   ahead=$(git rev-list --count "origin/$branch..$branch" 2>/dev/null || echo 0)
-  # 工作区有改动：先 stash 再 pull，最后 pop 并提交
+  # 工作区有改动且分支落后：先精确保存本次修改，同步后再恢复并提交
   if [[ -n "$dirty" ]]; then
     if [[ "$ahead" -gt 0 && "$behind" -gt 0 ]]; then
-      git stash push || { log "❌ stash 失败"; exit 1; }
-      git reset --hard "origin/$branch" || { log "❌ reset $branch 失败"; exit 1; }
-      git stash pop || { log "❌ stash pop 失败"; exit 1; }
+      create_auto_stash "$branch"
+      auto_stash_oid="$AUTO_STASH_OID"
+      git reset --hard "origin/$branch" || { log "❌ reset $branch 失败；自动 stash 已保留：${auto_stash_oid:-<未创建>}"; exit 1; }
+      restore_auto_stash "$branch" "$auto_stash_oid"
       behind=0
     elif [[ "$behind" -gt 0 ]]; then
-      git stash push || { log "❌ stash 失败"; exit 1; }
-      git pull || { log "❌ pull $branch 失败"; exit 1; }
+      create_auto_stash "$branch"
+      auto_stash_oid="$AUTO_STASH_OID"
+      git pull || { log "❌ pull $branch 失败；自动 stash 已保留：${auto_stash_oid:-<未创建>}"; exit 1; }
       behind=0
-      git stash pop || { log "❌ stash pop 失败"; exit 1; }
+      restore_auto_stash "$branch" "$auto_stash_oid"
+    else
+      commit_worktree_changes
     fi
-    git add .
-    git commit -m "自动化提交本地修改" || { log "❌ commit 失败"; exit 1; }
   fi
 
   ahead=$(git rev-list --count "origin/$branch..$branch" 2>/dev/null || echo 0)
